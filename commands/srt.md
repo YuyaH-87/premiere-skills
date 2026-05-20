@@ -36,14 +36,14 @@ XML は省略可能（ただし XML ありの方が時刻精度が高い）。
 
 絶対パスで Read:
 
-1. `~/ClaudeCode/projects/常時運用/premiere-skills/memory/feedback_srt_grouping_rules.md`
-2. `~/ClaudeCode/projects/常時運用/premiere-skills/memory/telop_channel_patterns.md`
+1. `C:/dev/premiere-skills/memory/feedback_srt_grouping_rules.md`
+2. `C:/dev/premiere-skills/memory/telop_channel_patterns.md`
 
 ### Step 1: ファイル存在確認 + 出力ディレクトリ
 
 ```bash
 VIDEO_BASENAME="$(basename '<wav>' .wav)"
-OUTPUT_DIR="$HOME/ClaudeCode/projects/常時運用/premiere-skills/output/srt/$VIDEO_BASENAME"
+OUTPUT_DIR="C:/dev/premiere-skills/output/srt/$VIDEO_BASENAME"
 mkdir -p "$OUTPUT_DIR"
 ```
 

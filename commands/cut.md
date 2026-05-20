@@ -28,7 +28,7 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 **必ず以下のディレクトリに出力すること**:
 
 ```
-~/ClaudeCode/projects/常時運用/premiere-skills/output/cut/
+C:/dev/premiere-skills/output/cut/
 ```
 
 出力ファイル名: `<入力ファイル名>_カット済み.xml`
@@ -40,7 +40,7 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 ```bash
 python3 "$HOME/.claude/scripts/silence_cut.py" \
   "<XMLファイルの絶対パス>" \
-  --output-dir "$HOME/ClaudeCode/projects/常時運用/premiere-skills/output/cut"
+  --output-dir "C:/dev/premiere-skills/output/cut"
 ```
 
 ## 結果報告
@@ -58,4 +58,4 @@ python3 "$HOME/.claude/scripts/silence_cut.py" \
 ─────────────────────────
 ```
 
-出力ファイルの絶対パス（`~/ClaudeCode/projects/常時運用/premiere-skills/output/cut/<basename>_カット済み.xml`）を必ず含め、Premiere Proで「ファイル > 読み込み」で読み込める旨を添える。
+出力ファイルの絶対パス（`C:/dev/premiere-skills/output/cut/<basename>_カット済み.xml`）を必ず含め、Premiere Proで「ファイル > 読み込み」で読み込める旨を添える。

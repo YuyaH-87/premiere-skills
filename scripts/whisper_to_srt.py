@@ -75,6 +75,10 @@ CORRECTIONS: dict[str, str] = {
     "コデックス": "Codex",         # ChatGPT Codex
     "コレックス": "Codex",         # ChatGPT Codex（別誤変換）
     "グロック": "Grok",            # ★ xAI Grok 11回/本
+    # ── 登山・アウトドア関連（2026-05-20 追加） ──
+    "ポカリスウェットラ": "ポカリスウェット",  # ポカリスウェットの誤認識
+    "ヤマップラ": "ヤマップ",        # YAMAPアプリの誤認識
+    "モンベルト": "モンベル",        # mont-bell ブランドの誤認識
     # ── 無料AIツール（No.769で追加） ──
     "フロー": "Flow",              # ★ Flow（無料AI） 12回/本
     # ── 音楽生成AI ──
@@ -294,6 +298,8 @@ def run_whisper(audio_path: str) -> list[dict]:
 
     if platform.system() == "Darwin":
         device, compute_type = "cpu", "int8"
+    elif platform.system() == "Windows":
+        device, compute_type = "cpu", "int8"
     else:
         device, compute_type = "auto", "auto"
 
@@ -407,6 +413,148 @@ def parse_xml_cut_points(xml_path: str) -> tuple[list[float], float]:
     sorted_cuts = sorted(cut_points)
     print(f"XMLカット点: {len(sorted_cuts)}個 (fps={best_fps:.4f})")
     return sorted_cuts, best_fps
+
+
+def build_src_to_tl_map(
+    xml_path: str,
+) -> tuple[list[tuple[float, float, float, float]], float, float]:
+    """A1トラックのクリップからソース→タイムライン変換マップを構築する。
+
+    FCP XML では:
+      <start>/<end>  = タイムライン上の位置（フレーム数）
+      <in>/<out>     = ソース素材の位置（フレーム数）
+
+    Returns:
+        clip_map: [(src_in, src_out, tl_start, tl_end), ...] 秒単位・tl_start順
+        fps: シーケンスの fps
+        tl_duration: タイムライン総尺（秒）
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    best_seq = None
+    best_v1_clips = 0
+    best_fps = FPS
+
+    for seq in root.iter("sequence"):
+        rate_el = seq.find(".//rate")
+        if rate_el is None:
+            continue
+        tb_el = rate_el.find("timebase")
+        ntsc_el = rate_el.find("ntsc")
+        if tb_el is None:
+            continue
+        timebase = int(tb_el.text)
+        ntsc = ntsc_el is not None and ntsc_el.text.upper() == "TRUE"
+        seq_fps = timebase * 1000 / 1001 if ntsc else float(timebase)
+
+        v_tracks = seq.findall(".//media/video/track")
+        if not v_tracks:
+            v_tracks = seq.findall(".//video/track")
+        v1_clip_count = len(v_tracks[0].findall("clipitem")) if v_tracks else 0
+
+        if v1_clip_count > best_v1_clips:
+            best_v1_clips = v1_clip_count
+            best_seq = seq
+            best_fps = seq_fps
+
+    if best_seq is None:
+        return [], FPS, 0.0
+
+    audio_tracks = best_seq.findall(".//media/audio/track")
+    if not audio_tracks:
+        return [], best_fps, 0.0
+
+    a1 = audio_tracks[0]
+    clip_map: list[tuple[float, float, float, float]] = []
+
+    for clip in a1.findall("clipitem"):
+        start_el = clip.find("start")
+        end_el   = clip.find("end")
+        in_el    = clip.find("in")
+        out_el   = clip.find("out")
+
+        if None in (start_el, end_el, in_el, out_el):
+            continue
+        if any(el.text in (None, "-1") for el in (start_el, end_el, in_el, out_el)):
+            continue
+
+        tl_start = int(start_el.text) / best_fps
+        tl_end   = int(end_el.text)   / best_fps
+        src_in   = int(in_el.text)    / best_fps
+        src_out  = int(out_el.text)   / best_fps
+
+        if tl_end > tl_start and src_out > src_in:
+            clip_map.append((src_in, src_out, tl_start, tl_end))
+
+    clip_map.sort(key=lambda x: x[2])  # tl_start 昇順
+
+    tl_duration = clip_map[-1][3] if clip_map else 0.0
+    print(f"ソース→TLマップ: {len(clip_map)}クリップ, TL尺={tl_duration:.2f}秒")
+    return clip_map, best_fps, tl_duration
+
+
+def remap_src_to_tl(
+    entries: list[tuple[float, float, str]],
+    clip_map: list[tuple[float, float, float, float]],
+    tl_duration: float,
+) -> list[tuple[float, float, str]]:
+    """SRTエントリをソース空間からタイムライン空間に変換する。
+
+    - start がカット区間（どのクリップにも属さない）に落ちるエントリは除外。
+    - end が別クリップかカット区間に跨る場合は、そのクリップの末尾1フレーム手前に丸める。
+
+    Args:
+        entries:     ソース空間の (start, end, text) リスト
+        clip_map:    (src_in, src_out, tl_start, tl_end) のリスト（tl_start 昇順）
+        tl_duration: タイムライン総尺（秒）
+
+    Returns:
+        タイムライン空間に変換された (start, end, text) リスト
+    """
+
+    def find_clip_idx(src_t: float) -> int:
+        """src_t が属するクリップのインデックス。なければ -1。"""
+        for i, (src_in, src_out, _, _) in enumerate(clip_map):
+            if src_in <= src_t < src_out:
+                return i
+        return -1
+
+    def src_to_tl(src_t: float, ci: int) -> float:
+        src_in, _, tl_start, _ = clip_map[ci]
+        return tl_start + (src_t - src_in)
+
+    result: list[tuple[float, float, str]] = []
+    skipped = 0
+    clipped_end_count = 0
+
+    for src_start, src_end, text in entries:
+        start_ci = find_clip_idx(src_start)
+        if start_ci < 0:
+            # カット区間 → このエントリはスキップ
+            skipped += 1
+            continue
+
+        tl_s = src_to_tl(src_start, start_ci)
+
+        end_ci = find_clip_idx(src_end)
+        if end_ci < 0 or end_ci != start_ci:
+            # end がカット区間か別クリップ → クリップ末尾1フレーム手前
+            _, _, _, clip_tl_end = clip_map[start_ci]
+            tl_e = clip_tl_end - 1.0 / FPS
+            clipped_end_count += 1
+        else:
+            tl_e = src_to_tl(src_end, end_ci)
+
+        tl_e = min(tl_e, tl_duration)
+        if tl_e <= tl_s:
+            tl_e = tl_s + 1.0 / FPS
+
+        result.append((tl_s, tl_e, text))
+
+    print(f"src→TLリマップ: {len(result)}件保持, "
+          f"{skipped}件スキップ(カット区間), {clipped_end_count}件end-clip")
+    return result
 
 
 def estimate_offset_from_xml(xml_root: ET.Element, fps: float) -> float:
@@ -562,6 +710,151 @@ def refine_timing(
     # 0ms表示エントリを除去
     snapped = [(s, e, t) for s, e, t in snapped if e > s]
 
+    return snapped
+
+
+def extend_entries_to_next(
+    entries: list[tuple[float, float, str]],
+    clip_map: list[tuple[float, float, float, float]] | None = None,
+    max_extend_s: float = 8.0,
+    max_total_dur_s: float = 7.0,
+    min_gap_s: float = 0.080,
+    final_tail_s: float = 2.0,
+    min_dur_s: float | None = None,
+    pre_roll_s: float | None = None,
+    fps: float = FPS,
+) -> list[tuple[float, float, str]]:
+    """各エントリの end を「次の start - min_gap_s」まで延長する（標準的字幕スタイル）。
+
+    refine_timing を完全置換する。pre-roll / min_duration / フレームスナップ /
+    重複解消 / クリップ境界制限を一括処理する。
+
+    制約 (三段制限・小さい方を採用):
+      ① 次のテロップ直前         (next_start - min_gap_s)
+      ② 元 end + max_extend_s    (発話と無関係な区間まで延長しない)
+      ③ 表示時間上限             (start + max_total_dur_s ★事故防止)
+      ④ TL不連続クリップ末尾     (clip_map 指定時のみ・通常は無効)
+      最終エントリは 元 end + final_tail_s で締めくくり
+      元 end より短縮はしない（発話の正確な end を保証）
+
+    Args:
+        entries:           TL 空間の (start, end, text) リスト
+        clip_map:          src→TL マップ。TL不連続時のみ境界制限を行う
+        max_extend_s:      元 end からの最大延長秒（デフォルト 8.0）
+        max_total_dur_s:   表示時間 (end - start) の絶対上限秒（デフォルト 7.0）
+                           これで「字幕が次ショットまで居座る」事故を物理的に防止
+        min_gap_s:         次エントリとの最小空白秒（デフォルト 0.080 = 80ms）
+        final_tail_s:      最終エントリの追加秒（デフォルト 2.0）
+        min_dur_s:         最小表示秒（None で MIN_DURATION_MS 採用）
+        pre_roll_s:        発話前のスタート前倒し秒（None で PRE_ROLL_MS 採用）
+        fps:               フレームレート
+    """
+    if not entries:
+        return entries
+
+    if min_dur_s is None:
+        min_dur_s = MIN_DURATION_MS / 1000.0
+    if pre_roll_s is None:
+        pre_roll_s = PRE_ROLL_MS / 1000.0
+
+    # clip_map による境界制限は silence_cut.py 出力 XML（TL 連続クリップ）
+    # では冗長かつ「次クリップ先頭 - min_gap_s」が現クリップ末尾より早くなり
+    # 逆に延長を阻害するため、TL 不連続クリップが含まれる場合のみ有効化する。
+    has_tl_gap = False
+    if clip_map and len(clip_map) >= 2:
+        for j in range(1, len(clip_map)):
+            if clip_map[j][2] - clip_map[j - 1][3] > 0.005:  # 5ms超のTLギャップ
+                has_tl_gap = True
+                break
+
+    def find_clip_for_tl(tl_t: float) -> int:
+        if not clip_map or not has_tl_gap:
+            return -1
+        for i, (_, _, ts, te) in enumerate(clip_map):
+            if ts <= tl_t < te:
+                return i
+        return -1
+
+    n = len(entries)
+    result: list[tuple[float, float, str]] = []
+
+    extended_count = 0
+    capped_by_max_extend = 0
+    capped_by_max_dur = 0
+    capped_by_clip = 0
+
+    for i in range(n):
+        s, e_orig, t = entries[i]
+
+        # ── pre-roll: 前エントリとのギャップに応じて start を前倒し ──
+        prev_end = result[i - 1][1] if i > 0 else 0.0
+        gap_before = s - prev_end
+        if gap_before > 0.05:
+            s_new = s - min(pre_roll_s, gap_before * 0.4)
+            s = max(prev_end, s_new, 0.0)
+
+        # ── end の決定（三段制限・最小値を採用） ──
+        # ① 次のテロップ直前 / ② 元end + max_extend / ③ 表示時間上限 / ④ TL不連続クリップ末尾
+        if i + 1 < n:
+            next_start = entries[i + 1][0]
+            cap_next = next_start - min_gap_s
+            cap_max  = e_orig + max_extend_s
+            cap_dur  = s + max_total_dur_s  # ★ 表示時間絶対上限 (事故防止)
+            target_end = min(cap_next, cap_max, cap_dur)
+            # どの制限が効いたかを記録
+            if cap_dur <= cap_next and cap_dur <= cap_max:
+                capped_by_max_dur += 1
+            elif cap_max < cap_next:
+                capped_by_max_extend += 1
+        else:
+            # 最終エントリ: 元 end + final_tail_s。ただし表示時間上限は適用
+            target_end = min(e_orig + final_tail_s, s + max_total_dur_s)
+
+        # クリップ末尾制限は TL ギャップがあるカット境界のみ
+        ci = find_clip_for_tl(s)
+        if ci >= 0:
+            clip_te = clip_map[ci][3] - 1.0 / fps
+            if clip_te < target_end:
+                capped_by_clip += 1
+            target_end = min(target_end, clip_te)
+
+        # 元 end より短縮しない（発話の正確な end を保証）
+        e_new = max(e_orig, target_end)
+
+        # 最小表示時間
+        if e_new - s < min_dur_s:
+            desired = s + min_dur_s
+            if i + 1 < n:
+                desired = min(desired, entries[i + 1][0] - min_gap_s)
+            e_new = max(e_new, desired)
+
+        if e_new > e_orig + 0.001:
+            extended_count += 1
+
+        result.append((s, e_new, t))
+
+    # フレームスナップ + 最小 1 フレーム
+    snapped: list[tuple[float, float, str]] = []
+    for s, e, t in result:
+        ss = snap_to_frame(s, fps)
+        se = snap_to_frame(e, fps)
+        if se <= ss:
+            se = ss + 1.0 / fps
+        snapped.append((ss, se, t))
+
+    # 重複解消（前 end > 次 start なら前を切り詰める）
+    for i in range(len(snapped) - 1):
+        s_cur, e_cur, t_cur = snapped[i]
+        s_next, _, _ = snapped[i + 1]
+        if e_cur > s_next:
+            snapped[i] = (s_cur, s_next, t_cur)
+
+    snapped = [(s, e, t) for s, e, t in snapped if e > s]
+
+    print(f"end延長: {extended_count}/{n}件延長, "
+          f"{capped_by_max_extend}件 max_extend({max_extend_s}s)で制限, "
+          f"{capped_by_max_dur}件 表示上限({max_total_dur_s}s)で制限, "
+          f"{capped_by_clip}件 クリップ境界で制限")
     return snapped
 
 
@@ -934,9 +1227,11 @@ def assemble_from_text(
     with open(text_path, encoding="utf-8") as f:
         raw_text = f.read()
 
-    # XML オフセット + カット点
+    # XML オフセット + カット点 + ソース→TLマップ
     cut_points: list[float] = []
     offset = 0.0
+    clip_map: list[tuple[float, float, float, float]] = []
+    tl_duration = 0.0
     if xml_path:
         tree = ET.parse(xml_path)
         xml_root = tree.getroot()
@@ -944,6 +1239,7 @@ def assemble_from_text(
         if cut_points:
             offset = estimate_offset_from_xml(xml_root, xml_fps)
             fps = xml_fps
+        clip_map, _, tl_duration = build_src_to_tl_map(xml_path)
 
     # Whisper 単語列（apply_corrections 適用済み）を flatten
     # NOTE: Whisper の word は細切れ（例: "A","IC","カ","ラ","ボ"）なので
@@ -1016,8 +1312,19 @@ def assemble_from_text(
     anchored = 0
     drift_sum = 0
     TAIL_DUR_S = 1.0  # 末尾で単語切れした行に付与する暫定表示秒数
-    SEARCH_RADIUS = 60   # 累積文字位置 ± この範囲内で行頭の prefix を探す
+    SEARCH_RADIUS = 300  # 累積文字位置 ± この範囲内で行頭の prefix を探す（後半ドリフト捕捉用に拡大）
     PROBE_LEN = 6        # 探索に使う行頭文字数
+
+    # ── 比例マッピング（drift 補正の基準位置） ─────────────────────────────
+    # lines.txt は LLM 改行で生 Whisper より短いことが多い。各行が始まる時点の
+    # 「lines.txt 累積正規化文字数」× 比率 で、Whisper 上の理想位置を推定する。
+    lines_norm_lens = [
+        len(_normalize_for_match(apply_corrections(l))) for l in lines
+    ]
+    lines_total_norm = sum(lines_norm_lens)
+    char_ratio = (total_chars / lines_total_norm) if lines_total_norm > 0 else 1.0
+    print(f"  比例マッピング: whisper_chars={total_chars}, lines_chars={lines_total_norm}, "
+          f"ratio={char_ratio:.3f}")
 
     min_pos = 0  # アンカー検索の下限（前エントリの終端を下回らない）
 
@@ -1034,6 +1341,7 @@ def assemble_from_text(
         idx = whisper_norm_text.find(probe, lo, hi)
         return idx
 
+    cum_lines = 0  # この行が始まる時点の lines.txt 累積正規化文字数
     for line in lines:
         line_display = apply_corrections(line)
         line_norm = _normalize_for_match(line_display)
@@ -1047,14 +1355,27 @@ def assemble_from_text(
             entries.append((start_time, end_time, line_display))
             last_end_time = end_time
             tail_count += 1
+            cum_lines += line_len
             continue
 
-        # 1. 累積文字数 pos 周辺で行頭の prefix を局所検索
-        anchor = _local_anchor(line_norm, pos)
+        # 1. 比例マッピングで理想位置を計算し、pos と max を取る
+        #    （pos より後ろの理想位置 = 累積ドリフトの基準）
+        ideal_pos = int(cum_lines * char_ratio)
+        expected = max(pos, min(ideal_pos, total_chars - 1))
+
+        # 2. expected 周辺で行頭 prefix をアンカー検索
+        anchor = _local_anchor(line_norm, expected)
         if anchor >= 0 and anchor != pos:
             drift_sum += anchor - pos
             anchored += 1
             pos = anchor
+        elif anchor < 0 and ideal_pos > pos + SEARCH_RADIUS:
+            # アンカーは見つからず、理想位置が pos より大幅後ろなら ideal_pos に飛ぶ
+            # （短い行など、prefix マッチが効かないケースの drift 補正）
+            new_pos = min(ideal_pos, total_chars - 1)
+            drift_sum += new_pos - pos
+            anchored += 1
+            pos = new_pos
 
         end_pos = min(pos + line_len, total_chars) - 1
         start_widx = char_to_word[pos]
@@ -1066,6 +1387,7 @@ def assemble_from_text(
         last_end_time = max(last_end_time, end_time)
         pos += line_len
         min_pos = pos  # 次行のアンカー検索はここより前を探さない
+        cum_lines += line_len  # 次行の比例マッピング用
 
     print(f"\n改行テキスト → SRT")
     print(f"  入力行数: {len(lines)}")
@@ -1076,9 +1398,28 @@ def assemble_from_text(
         print(f"  アンカー再同期: {anchored} 行（累積drift補正合計 {drift_sum:+d} 文字）")
 
     # タイミング調整
-    entries = refine_timing(entries, fps)
-    if cut_points:
-        entries = snap_to_cut_points(entries, cut_points)
+    # ソース空間判定: Whisper 最終単語時刻が TL 尺の 5% 超 → ソース WAV 確定
+    is_src_space = (
+        tl_duration > 0
+        and bool(clip_map)
+        and bool(words)
+        and words[-1]["end"] > tl_duration * 1.05
+    )
+
+    if is_src_space:
+        last_t = words[-1]["end"]
+        print(f"\nソース空間検出: Whisper最終={last_t:.1f}s > TL尺={tl_duration:.1f}s×1.05")
+        print("  ソース→TLタイムスタンプ変換を適用します")
+        entries = remap_src_to_tl(entries, clip_map, tl_duration)
+        entries = extend_entries_to_next(entries, clip_map=clip_map, fps=fps)
+    else:
+        entries = extend_entries_to_next(
+            entries,
+            clip_map=clip_map if clip_map else None,
+            fps=fps,
+        )
+        if cut_points:
+            entries = snap_to_cut_points(entries, cut_points)
 
     # Premiere Pro 日本語版: UTF-8 BOM + CRLF
     with open(output_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
@@ -1135,8 +1476,8 @@ def assemble_srt(
         print("エラー: グルーピングデータが空です")
         sys.exit(1)
 
-    # タイミング調整（pre-roll, post-roll, gap fill, min duration, frame snap）
-    entries = refine_timing(entries, fps)
+    # タイミング調整（次テロップ直前までend延長、pre-roll, min duration, frame snap）
+    entries = extend_entries_to_next(entries, fps=fps)
 
     # カット点スナップ（微調整）
     if cut_points:
@@ -1213,7 +1554,7 @@ def main() -> None:
         "--output-dir",
         help="全ての出力ファイルをこのディレクトリに配置する。"
              "指定しない場合は入力ファイルと同じディレクトリ。"
-             "推奨: ~/ClaudeCode/projects/premiere-skills/output/srt/<video-name>/",
+             "推奨: C:/dev/premiere-skills/output/srt/<video-name>/",
     )
     args = parser.parse_args()
 

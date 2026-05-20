@@ -11,12 +11,32 @@ import re
 import copy
 import os
 import sys
+import shutil
 from urllib.parse import unquote, urlparse
+
+
+def find_ffmpeg():
+    """ffmpegの実行パスを返す。PATHになければWindows既知の場所から探す。"""
+    if shutil.which('ffmpeg'):
+        return 'ffmpeg'
+    candidates = [
+        r'C:\Program Files (x86)\Wondershare\Recoverit\ffmpeg.exe',
+        r'C:\Program Files\Adobe\Adobe Substance 3D Stager\ffmpeg.exe',
+        os.path.expandvars(r'%LOCALAPPDATA%\LINE\Data\plugin\ffmpeg\1.0.0.5\ffmpeg.exe'),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return 'ffmpeg'  # fallbackとしてそのまま返す（エラーは実行時に出る）
 
 
 def pathurl_to_filepath(pathurl):
     parsed = urlparse(pathurl)
-    return unquote(parsed.path)
+    path = unquote(parsed.path)
+    # Windows: file://localhost/E:/... → /E:/... → E:/...
+    if sys.platform == 'win32' and len(path) >= 3 and path[0] == '/' and path[2] == ':':
+        path = path[1:]
+    return path
 
 
 def build_file_id_map(root):
@@ -43,10 +63,31 @@ def resolve_file_path(clip, file_id_map):
     return None
 
 
+def get_media_duration(filepath):
+    """ffmpeg -i でメディアファイルの再生時間（秒）を取得する。失敗時 None。
+
+    用途: XML が宣言する src 長と実 MOV の長さがズレるケース（fps 変換誤差等）
+    で、実 MOV を超える領域を「データ無し」として確実にカットするため。
+    """
+    if not filepath or not os.path.exists(filepath):
+        return None
+    cmd = [find_ffmpeg(), '-hide_banner', '-i', filepath]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None
+    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+    m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.\d+)', stderr_text)
+    if not m:
+        return None
+    h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    return h * 3600 + mn * 60 + s
+
+
 def detect_silence(audio_file, start_sec, duration_sec, threshold_db=-35, min_silence=0.2):
     """ffmpeg silencedetectで無音区間を検出。返り値は(start_sec, end_sec)のリスト（絶対時間）"""
     cmd = [
-        'ffmpeg', '-hide_banner',
+        find_ffmpeg(), '-hide_banner',
         '-ss', str(start_sec),
         '-t', str(duration_sec),
         '-i', audio_file,
@@ -54,11 +95,12 @@ def detect_silence(audio_file, start_sec, duration_sec, threshold_db=-35, min_si
         '-af', f'silencedetect=noise={threshold_db}dB:d={min_silence}',
         '-f', 'null', '-'
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    result = subprocess.run(cmd, capture_output=True, timeout=3600)
+    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
 
     silences = []
     silence_start = None
-    for line in result.stderr.split('\n'):
+    for line in stderr_text.split('\n'):
         if 'silence_start:' in line:
             m = re.search(r'silence_start:\s*([\d.eE+-]+)', line)
             if m:
@@ -87,7 +129,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         help="出力ディレクトリ。指定時はこのディレクトリに '<basename>_カット済み.xml' を配置。"
-             "推奨: ~/ClaudeCode/projects/premiere-skills/output/cut/",
+             "推奨: C:/dev/premiere-skills/output/cut/",
     )
     parser.add_argument("--threshold", type=float, default=-35,
                         help="無音判定の閾値(dB)。小さい値ほど厳しく(=カット減)。ぶつぶつ喋りは -45〜-50 推奨")
@@ -219,6 +261,25 @@ def main():
 
         silences = detect_silence(audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
         print(f"    検出無音: {len(silences)}箇所")
+
+        # MOV 実尺キャップ: XML 宣言の src 終端より実 MOV が短い場合、
+        # 超過分（実 MOV 外＝再生時にブラック+無音）を強制カット領域に追加。
+        # 主な要因は fps の整数/NTSC 解釈ズレ（29 vs 30/29.97 等）。
+        actual_mov_dur = get_media_duration(audio_file)
+        if actual_mov_dur is not None:
+            xml_declared_end = in_sec + dur_sec  # XML が宣言する src 終端（秒）
+            if actual_mov_dur < xml_declared_end - 0.05:
+                overflow_src_start = actual_mov_dur
+                overflow_src_end = xml_declared_end
+                sf_start = int(round(overflow_src_start * timebase))
+                sf_end = int(round(overflow_src_end * timebase))
+                tf_start = max(sf_start - a1_clip['offset'], a1_clip['tl_start'])
+                tf_end = min(sf_end - a1_clip['offset'], a1_clip['tl_end'])
+                if tf_end > tf_start:
+                    all_silence_tl_frames.append((tf_start, tf_end))
+                    print(f"    MOV実尺キャップ: src[{actual_mov_dur:.2f}s, "
+                          f"{xml_declared_end:.2f}s]を強制カット "
+                          f"({(tf_end-tf_start)/timebase:.2f}s 削減)")
 
         # ソース秒 → タイムラインフレームに変換
         for s_start, s_end in silences:

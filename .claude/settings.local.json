@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Wondershare\\\\Recoverit\\\\ffmpeg.exe\" -ss 1300 -i \"E:/登山動画2025/ノウハウ動画/20250717_熱中症対策５つ/IMG_E2111.MOV\" -t 60 -af \"volumedetect\" -vf \"blackdetect=d=0.5:pix_th=0.10\" -f null NUL)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Wondershare\\\\Recoverit\\\\ffmpeg.exe\" -i \"E:/登山動画2025/ノウハウ動画/20250717_熱中症対策５つ/IMG_E2111.MOV\")",
+      "Bash(python scripts/whisper_to_srt.py --from-text \"output/srt/test_sozai_20260520/test_sozai_20260520.lines.txt\" --segments \"output/srt/test_sozai_20260520/test_sozai_20260520.segments.json\" --xml \"output/cut/test_sozai_20260520_カット済み.xml\" -o \"output/srt/test_sozai_20260520/test_sozai_20260520.srt\")",
+      "Bash(python scripts/silence_cut.py)",
+      "Bash(python scripts/silence_cut.py \"input/test_sozai_20260520.xml\" --output-dir \"output/cut/\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
